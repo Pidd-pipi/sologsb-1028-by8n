@@ -1,11 +1,44 @@
 import { createInitialState } from './data';
-import type { ComponentSnapshot, ComponentSpec, ValidationIssue, WorkspaceState } from './types';
+import type {
+  BulkCopyOutcome,
+  ComponentSnapshot,
+  ComponentSpec,
+  CopyConflict,
+  CopyDirection,
+  CopyOutcome,
+  PropertySpec,
+  ValidationIssue,
+  WorkspaceState
+} from './types';
 
 const STORAGE_KEY = 'sologsb-1028-workspace-v1';
 
 const clone = <T>(value: T): T => structuredClone(value);
 const uid = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 const signature = (component: ComponentSpec) => `${component.properties.map((item) => `${item.name}:${item.required}`).join('|')}::${component.interactionSignature}`;
+
+/**
+ * After a property is copied in from a comparison, examples that reference it
+ * (by id at copy time or by name in their code) become pending review.
+ * Returns how many examples were newly marked. Snapshots are never touched.
+ */
+function markExamplesPendingReview(target: ComponentSpec, ...propertyNames: string[]): number {
+  const names = new Set(propertyNames.map((name) => name.trim()));
+  let staleCount = 0;
+  const referencedIds = new Set(
+    target.properties.filter((property) => names.has(property.name.trim())).map((property) => property.id)
+  );
+  for (const example of target.examples) {
+    const referencesById = example.propertyIds.some((id) => referencedIds.has(id));
+    const referencesByName = [...names].some((name) => example.code.includes(name));
+    if (referencesById || referencesByName) {
+      if (!example.stale) staleCount += 1;
+      example.stale = true;
+      example.staleReason = `对照复制了属性 ${[...names].join('、')}，示例引用需要复核。`;
+    }
+  }
+  return staleCount;
+}
 
 export class SpecStore extends EventTarget {
   state: WorkspaceState;
@@ -194,6 +227,117 @@ export class SpecStore extends EventTarget {
       target.revision += 1;
       target.updatedAt = new Date().toISOString();
     });
+  }
+
+  copyProperty(sourceComponentId: string, targetComponentId: string, propertyName: string, direction: CopyDirection): CopyOutcome {
+    const source = this.state.components.find((item) => item.id === sourceComponentId);
+    const target = this.state.components.find((item) => item.id === targetComponentId);
+    if (!source || !target) {
+      return { ok: false, propertyName, targetRevision: target?.revision ?? 0, reason: '对照的组件不存在，请重新选择。' };
+    }
+    const sourceProperty = this.findPropertyByName(source, propertyName);
+    if (!sourceProperty) {
+      return { ok: false, propertyName, targetRevision: target.revision, reason: `源组件上找不到属性 ${propertyName}。` };
+    }
+    const existing = this.findPropertyByName(target, propertyName);
+    if (existing) {
+      const conflict = this.buildConflict(sourceProperty, existing, source.id, target.id, direction);
+      if (conflict) return { ok: false, propertyName, targetRevision: target.revision, reason: conflict.detail, conflict };
+    }
+
+    let outcome: CopyOutcome = { ok: false, propertyName, targetRevision: target.revision, reason: '复制未执行。' };
+    this.commit('对照复制属性', (state) => {
+      const targetInState = state.components.find((item) => item.id === targetComponentId);
+      if (!targetInState) return;
+      const counterpart = targetInState.properties.find((item) => item.name.trim() === propertyName.trim());
+      if (counterpart) {
+        // Same name and an equal contract: sync only the description and default.
+        counterpart.description = sourceProperty.description;
+        counterpart.defaultValue = sourceProperty.defaultValue;
+      } else {
+        const added: PropertySpec = { ...structuredClone(sourceProperty), id: uid('property') };
+        targetInState.properties.push(added);
+      }
+      const staleCount = markExamplesPendingReview(targetInState, propertyName);
+      targetInState.revision += 1;
+      targetInState.updatedAt = new Date().toISOString();
+      outcome = {
+        ok: true,
+        propertyName,
+        mode: counterpart ? 'updated' : 'added',
+        staleCount,
+        targetRevision: targetInState.revision
+      };
+    });
+    return outcome;
+  }
+
+  bulkCopyProperties(sourceComponentId: string, targetComponentId: string, propertyNames: string[], direction: CopyDirection): BulkCopyOutcome {
+    const source = this.state.components.find((item) => item.id === sourceComponentId);
+    const target = this.state.components.find((item) => item.id === targetComponentId);
+    if (!source || !target) return { copied: [], staleCount: 0, targetRevision: target?.revision ?? 0 };
+
+    // Pre-flight the whole batch: a single conflicting name aborts everything and changes no state.
+    for (const name of propertyNames) {
+      const sourceProperty = this.findPropertyByName(source, name);
+      const existing = this.findPropertyByName(target, name);
+      if (!sourceProperty || !existing) continue;
+      const conflict = this.buildConflict(sourceProperty, existing, source.id, target.id, direction);
+      if (conflict) return { copied: [], staleCount: 0, targetRevision: target.revision, conflict };
+    }
+
+    let result: BulkCopyOutcome = { copied: [], staleCount: 0, targetRevision: target.revision };
+    this.commit('对照批量复制属性', (state) => {
+      const sourceInState = state.components.find((item) => item.id === sourceComponentId);
+      const targetInState = state.components.find((item) => item.id === targetComponentId);
+      if (!sourceInState || !targetInState) return;
+      const staleNames = new Set<string>();
+      for (const name of propertyNames) {
+        const sourceProperty = this.findPropertyByName(sourceInState, name);
+        if (!sourceProperty) continue;
+        const counterpart = this.findPropertyByName(targetInState, name);
+        if (counterpart) {
+          counterpart.description = sourceProperty.description;
+          counterpart.defaultValue = sourceProperty.defaultValue;
+        } else {
+          targetInState.properties.push({ ...structuredClone(sourceProperty), id: uid('property') });
+        }
+        staleNames.add(sourceProperty.name.trim());
+      }
+      const staleCount = markExamplesPendingReview(targetInState, ...staleNames);
+      targetInState.revision += 1;
+      targetInState.updatedAt = new Date().toISOString();
+      result = { copied: [...staleNames], staleCount, targetRevision: targetInState.revision };
+    });
+    return result;
+  }
+
+  private findPropertyByName(component: ComponentSpec, name: string): PropertySpec | undefined {
+    return component.properties.find((property) => property.name.trim() === name.trim());
+  }
+
+  private buildConflict(
+    sourceProperty: PropertySpec,
+    targetProperty: PropertySpec,
+    sourceComponentId: string,
+    targetComponentId: string,
+    direction: CopyDirection
+  ): CopyConflict | undefined {
+    const typeDiffer = sourceProperty.type.trim() !== targetProperty.type.trim();
+    const requiredDiffer = sourceProperty.required !== targetProperty.required;
+    if (!typeDiffer && !requiredDiffer) return undefined;
+    const fragments: string[] = [];
+    if (typeDiffer) fragments.push(`类型 ${sourceProperty.type} ↔ ${targetProperty.type}`);
+    if (requiredDiffer) fragments.push(`必填 ${sourceProperty.required ? '是' : '否'} ↔ ${targetProperty.required ? '是' : '否'}`);
+    return {
+      name: sourceProperty.name,
+      direction,
+      sourceComponentId,
+      targetComponentId,
+      source: sourceProperty,
+      target: targetProperty,
+      detail: `同名属性 ${sourceProperty.name} 契约不同：${fragments.join('；')}。已停下，未改动目标组件。`
+    };
   }
 
   validate(): ValidationIssue[] {

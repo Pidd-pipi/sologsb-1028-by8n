@@ -13,7 +13,8 @@ const components: ComponentSpec[] = [
     properties: [
       { id: 'p-label', name: 'label', type: 'string', required: true, defaultValue: '保存', description: '按钮可见文字，同时作为无障碍名称。' },
       { id: 'p-disabled', name: 'disabled', type: 'boolean', required: false, defaultValue: 'false', description: '禁用交互，但不隐藏按钮。' },
-      { id: 'p-variant', name: 'variant', type: 'accent | primary | secondary', required: false, defaultValue: 'secondary', description: '控制动作层级。' }
+      { id: 'p-variant', name: 'variant', type: 'accent | primary | secondary', required: false, defaultValue: 'secondary', description: '控制动作层级。' },
+      { id: 'p-button-size', name: 'size', type: "'s' | 'm' | 'l'", required: false, defaultValue: 'm', description: '按钮物理尺寸档位。' }
     ],
     states: 'default、hover、focus-visible、pressed、disabled、pending。',
     keyboardBehavior: 'Tab 聚焦，Space 或 Enter 触发。焦点环必须清晰可见。',
@@ -54,7 +55,8 @@ const components: ComponentSpec[] = [
     properties: [
       { id: 'p-field-label', name: 'label', type: 'string', required: true, defaultValue: '组件名称', description: '字段可见标签，并关联输入框。' },
       { id: 'p-field-required', name: 'required', type: 'boolean', required: false, defaultValue: 'false', description: '标记必填；提交后再显示错误。' },
-      { id: 'p-field-help', name: 'helpText', type: 'string', required: false, defaultValue: '', description: '输入前帮助信息。' }
+      { id: 'p-field-help', name: 'helpText', type: 'string', required: false, defaultValue: '', description: '输入前帮助信息。' },
+      { id: 'p-field-size', name: 'size', type: 'string', required: true, defaultValue: '', description: '自由文本尺寸令牌，由主题提供。' }
     ],
     states: 'empty、filled、focus-visible、invalid、disabled、read-only。',
     keyboardBehavior: 'Tab 进入和离开，文本编辑沿用平台按键。',

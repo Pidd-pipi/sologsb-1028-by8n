@@ -66,3 +66,39 @@ export interface DiffRow {
   before: string;
   after: string;
 }
+
+export type PropertyDiffKind = 'left-only' | 'right-only' | 'contract-diff' | 'aligned';
+
+export interface PropertyDiffRow {
+  kind: PropertyDiffKind;
+  name: string;
+  left?: PropertySpec;
+  right?: PropertySpec;
+  typeDiffer: boolean;
+  requiredDiffer: boolean;
+  descriptionDiffer: boolean;
+  defaultDiffer: boolean;
+}
+
+export type CopyDirection = 'left-to-right' | 'right-to-left';
+
+export interface CopyConflict {
+  name: string;
+  direction: CopyDirection;
+  sourceComponentId: string;
+  targetComponentId: string;
+  source: PropertySpec;
+  target: PropertySpec;
+  detail: string;
+}
+
+export type CopyOutcome =
+  | { ok: true; propertyName: string; mode: 'added' | 'updated'; staleCount: number; targetRevision: number }
+  | { ok: false; propertyName: string; targetRevision: number; reason: string; conflict?: CopyConflict };
+
+export interface BulkCopyOutcome {
+  copied: string[];
+  staleCount: number;
+  targetRevision: number;
+  conflict?: CopyConflict;
+}
