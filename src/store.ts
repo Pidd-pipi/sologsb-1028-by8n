@@ -1,5 +1,5 @@
 import { createInitialState } from './data';
-import type { ComponentSnapshot, ComponentSpec, ValidationIssue, WorkspaceState } from './types';
+import type { ComponentSnapshot, ComponentSpec, CopyPropertyResult, ValidationIssue, WorkspaceState } from './types';
 
 const STORAGE_KEY = 'sologsb-1028-workspace-v1';
 
@@ -194,6 +194,71 @@ export class SpecStore extends EventTarget {
       target.revision += 1;
       target.updatedAt = new Date().toISOString();
     });
+  }
+
+  /**
+   * 对照视图：把源组件的某个属性复制到目标组件。
+   * - 目标没有同名属性 → 新增属性；
+   * - 目标有同名属性且契约（类型 / 必填）一致 → 仅更新描述与默认值；
+   * - 目标有同名属性但契约不同 → 不提交任何修改，返回冲突说明。
+   * 成功时目标组件生成新修订，引用该属性的示例转为待复核；既有快照保持不变。
+   */
+  copyPropertyBetween(sourceId: string, propertyId: string, targetId: string): CopyPropertyResult {
+    const source = this.state.components.find((item) => item.id === sourceId);
+    const target = this.state.components.find((item) => item.id === targetId);
+    const property = source?.properties.find((item) => item.id === propertyId);
+    if (!source || !target || !property || sourceId === targetId) {
+      return { status: 'invalid', message: '源或目标组件不存在，或两侧选择了同一组件。', staleCount: 0 };
+    }
+    const existing = target.properties.find((item) => item.name.trim() === property.name.trim());
+    if (existing && (existing.type.trim() !== property.type.trim() || existing.required !== property.required)) {
+      return {
+        status: 'conflict',
+        message: `已停止复制：目标组件已存在同名属性 “${property.name}”，但契约不同。源为 ${property.type.trim() || '（空类型）'} / ${property.required ? '必填' : '可选'}，目标为 ${existing.type.trim() || '（空类型）'} / ${existing.required ? '必填' : '可选'}。请先在编辑器里对齐契约，再重新复制。`,
+        staleCount: 0
+      };
+    }
+    let staleCount = 0;
+    let revision = target.revision;
+    this.commit('对照复制属性', (state) => {
+      const draft = state.components.find((item) => item.id === targetId);
+      if (!draft) return;
+      if (existing) {
+        const draftProperty = draft.properties.find((item) => item.id === existing.id);
+        if (draftProperty) {
+          draftProperty.description = property.description;
+          draftProperty.defaultValue = property.defaultValue;
+        }
+      } else {
+        draft.properties.push({
+          id: uid('property'),
+          name: property.name,
+          type: property.type,
+          required: property.required,
+          defaultValue: property.defaultValue,
+          description: property.description
+        });
+      }
+      draft.revision += 1;
+      revision = draft.revision;
+      draft.updatedAt = new Date().toISOString();
+      draft.examples.forEach((example) => {
+        const references = (existing !== undefined && example.propertyIds.includes(existing.id)) || example.code.includes(property.name);
+        if (references && !example.stale) {
+          example.stale = true;
+          example.staleReason = `对照复制使属性 ${property.name} ${existing ? '的描述或默认值更新' : '新增到组件'}（r${draft.revision}），示例转为待复核。`;
+          staleCount += 1;
+        }
+      });
+    });
+    return {
+      status: existing ? 'updated' : 'added',
+      message: existing
+        ? `契约一致，已把 “${property.name}” 的描述与默认值同步到目标组件。`
+        : `已将属性 “${property.name}” 复制到目标组件。`,
+      staleCount,
+      revision
+    };
   }
 
   validate(): ValidationIssue[] {

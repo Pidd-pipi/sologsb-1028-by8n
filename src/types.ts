@@ -66,3 +66,10 @@ export interface DiffRow {
   before: string;
   after: string;
 }
+
+export interface CopyPropertyResult {
+  status: 'added' | 'updated' | 'conflict' | 'invalid';
+  message: string;
+  staleCount: number;
+  revision?: number;
+}

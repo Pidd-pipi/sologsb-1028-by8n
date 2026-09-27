@@ -1,10 +1,18 @@
 import { LitElement, css, html, nothing, type TemplateResult } from 'lit';
 import { repeat } from 'lit/directives/repeat.js';
+import { compareProperties, describeContract, type PropertyComparison } from './compare';
 import { diffAgainstSnapshot } from './diff';
 import { SpecStore } from './store';
 import type { ComponentExample, ComponentSpec, PreviewDensity, PreviewTheme, PropertySpec, ValidationIssue } from './types';
 
-type EditorTab = 'overview' | 'api' | 'accessibility' | 'examples' | 'history';
+type EditorTab = 'overview' | 'api' | 'accessibility' | 'examples' | 'history' | 'compare';
+
+const COMPARE_STORAGE_KEY = 'sologsb-1028-compare-v1';
+
+interface ComparePair {
+  leftId: string;
+  rightId: string;
+}
 
 export class SpecA11yWorkbench extends LitElement {
   static properties = {
@@ -13,7 +21,10 @@ export class SpecA11yWorkbench extends LitElement {
     previewTheme: { state: true },
     previewDensity: { state: true },
     toast: { state: true },
-    showValidation: { state: true }
+    showValidation: { state: true },
+    compareLeftId: { state: true },
+    compareRightId: { state: true },
+    compareConflict: { state: true }
   };
 
   private store = new SpecStore();
@@ -23,6 +34,9 @@ export class SpecA11yWorkbench extends LitElement {
   private previewDensity: PreviewDensity = 'regular';
   private toast = '';
   private showValidation = true;
+  private compareLeftId = '';
+  private compareRightId = '';
+  private compareConflict = '';
   private toastTimer?: number;
 
   static styles = css`
@@ -113,6 +127,25 @@ export class SpecA11yWorkbench extends LitElement {
     .before { color: var(--spectrum-red-800); white-space: pre-wrap; }
     .after { color: var(--spectrum-green-900); white-space: pre-wrap; }
     pre { white-space: pre-wrap; word-break: break-word; background: #202020; color: #f5f5f5; padding: 12px; border-radius: 8px; font-size: 12px; }
+    .compare-pickers { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+    .compare-picker { display: grid; gap: 6px; flex: 1; min-width: 200px; }
+    .compare-picker > span { font-size: 12px; font-weight: 700; }
+    .compare-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .compare-card { border: 1px solid var(--spectrum-gray-300); border-radius: 12px; padding: 14px; background: var(--spectrum-gray-75, var(--spectrum-gray-100)); min-width: 0; }
+    .compare-card h3 { margin: 0; font-size: 15px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .compare-meta { margin: 4px 0 12px; color: var(--spectrum-gray-700); font-size: 12px; }
+    .compare-field { padding: 9px 10px; border-radius: 8px; background: var(--spectrum-gray-100); margin-bottom: 8px; border: 1px solid transparent; }
+    .compare-field.changed { border-color: var(--spectrum-orange-500); background: var(--spectrum-orange-100); }
+    .compare-field b { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 12px; margin-bottom: 4px; }
+    .compare-field p { margin: 0; font-size: 12px; line-height: 1.6; white-space: pre-wrap; color: var(--spectrum-gray-800); }
+    .compare-group { margin-top: 20px; }
+    .compare-group > h3 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; display: flex; align-items: center; gap: 8px; }
+    .compare-row { border: 1px solid var(--spectrum-gray-300); border-radius: 10px; padding: 12px; margin-bottom: 10px; background: var(--spectrum-gray-75, var(--spectrum-gray-100)); }
+    .compare-row-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+    .compare-row-head strong { font-size: 14px; }
+    .contract { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; background: var(--spectrum-gray-200); border-radius: 6px; padding: 2px 7px; }
+    .compare-note { margin: 6px 0 0; font-size: 12px; color: var(--spectrum-gray-700); }
+    .compare-actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .search-empty { padding: 20px 8px; color: var(--spectrum-gray-700); font-size: 13px; }
     .footer-hint { position: fixed; bottom: 10px; left: 50%; transform: translateX(-50%); z-index: 30; background: #202020; color: white; border-radius: 999px; padding: 6px 12px; font-size: 11px; opacity: .9; }
     sp-toast { position: fixed; right: 18px; bottom: 18px; z-index: 50; }
@@ -130,6 +163,7 @@ export class SpecA11yWorkbench extends LitElement {
       .inspector { grid-template-columns: 1fr; }
       .form-grid { grid-template-columns: 1fr; }
       .field.full { grid-column: auto; }
+      .compare-grid { grid-template-columns: 1fr; }
       .main { padding: 14px; }
       .title-row { display: grid; }
       .actions { justify-content: flex-start; }
@@ -138,6 +172,7 @@ export class SpecA11yWorkbench extends LitElement {
 
   connectedCallback() {
     super.connectedCallback();
+    this.restoreComparePair();
     this.store.addEventListener('change', this.onStoreChange);
     window.addEventListener('keydown', this.onKeyDown);
   }
@@ -148,6 +183,7 @@ export class SpecA11yWorkbench extends LitElement {
   }
 
   private onStoreChange = () => {
+    this.ensureComparePairValid();
     this.requestUpdate();
   };
 
@@ -174,7 +210,7 @@ export class SpecA11yWorkbench extends LitElement {
       this.store.addComponent();
       return;
     }
-    const tabMap: Record<string, EditorTab> = { '1': 'overview', '2': 'api', '3': 'accessibility', '4': 'examples', '5': 'history' };
+    const tabMap: Record<string, EditorTab> = { '1': 'overview', '2': 'api', '3': 'accessibility', '4': 'examples', '5': 'history', '6': 'compare' };
     if (event.altKey && tabMap[event.key]) {
       event.preventDefault();
       this.tab = tabMap[event.key];
@@ -232,7 +268,7 @@ export class SpecA11yWorkbench extends LitElement {
             </aside>
           </div>
           ${this.toast ? html`<sp-toast open variant="positive" timeout="3000">${this.toast}</sp-toast>` : nothing}
-          <div class="footer-hint">⌘/Ctrl+Z 撤销 · ⇧⌘/Ctrl+Z 重做 · ⌘/Ctrl+K 搜索 · Alt+1–5 切换面板</div>
+          <div class="footer-hint">⌘/Ctrl+Z 撤销 · ⇧⌘/Ctrl+Z 重做 · ⌘/Ctrl+K 搜索 · Alt+1–6 切换面板</div>
         </div>
       </sp-theme>
     `;
@@ -261,12 +297,14 @@ export class SpecA11yWorkbench extends LitElement {
         ${this.renderTab('accessibility', '3 无障碍')}
         ${this.renderTab('examples', '4 示例')}
         ${this.renderTab('history', '5 版本')}
+        ${this.renderTab('compare', '6 对照')}
       </div>
       ${this.tab === 'overview' ? this.renderOverview(component) : nothing}
       ${this.tab === 'api' ? this.renderApi(component) : nothing}
       ${this.tab === 'accessibility' ? this.renderAccessibility(component) : nothing}
       ${this.tab === 'examples' ? this.renderExamples(component) : nothing}
       ${this.tab === 'history' ? this.renderHistory(component) : nothing}
+      ${this.tab === 'compare' ? this.renderCompare() : nothing}
     `;
   }
 
@@ -399,6 +437,246 @@ export class SpecA11yWorkbench extends LitElement {
         ${this.hasStaleExamples(component) ? html`<div class="issue warning" style="margin-top: 14px"><strong>检测到待迁移示例</strong>迁移会保留代码内容，清理已删除属性引用并更新契约版本。<br /><button @click=${() => this.store.migrateExamples()}>立即迁移</button></div>` : nothing}
       </section>
     `;
+  }
+
+  private renderCompare(): TemplateResult {
+    const left = this.compareLeft;
+    const right = this.compareRight;
+    if (!left || !right) {
+      return html`<section class="panel" aria-label="组件对照"><div class="empty">目录中至少需要两个组件才能对照。</div></section>`;
+    }
+    if (left.id === right.id) {
+      return html`
+        <section class="panel" aria-label="组件对照">
+          ${this.renderComparePickers(left.id, right.id)}
+          <div class="issue info"><strong>两侧是同一组件</strong>请在上方为其中一侧选择另一个组件。</div>
+        </section>
+      `;
+    }
+    const rows = compareProperties(left, right);
+    const onlyLeft = rows.filter((row) => row.kind === 'only-left');
+    const onlyRight = rows.filter((row) => row.kind === 'only-right');
+    const contractDiffs = rows.filter((row) => row.kind === 'contract-diff');
+    const sameContractRows = rows.filter((row) => row.kind === 'same-contract');
+    const fullyAligned = !onlyLeft.length && !onlyRight.length && !contractDiffs.length && sameContractRows.every((row) => !row.contentDiffs.length);
+    return html`
+      <section class="panel" aria-label="组件对照">
+        ${this.renderComparePickers(left.id, right.id)}
+        <p class="compare-note">对照选择仅保存在本地浏览器。复制属性会为目标组件生成新修订，引用该属性的示例转为待复核；既有快照保持不变。</p>
+        ${this.compareConflict ? html`<div class="issue error" role="alert"><strong>契约冲突，已停止复制</strong>${this.compareConflict}</div>` : nothing}
+        <div class="compare-grid">
+          ${this.renderCompareCard(left, right, '左侧')}
+          ${this.renderCompareCard(right, left, '右侧')}
+        </div>
+        <p class="compare-note" style="margin-top:16px">属性分组：仅左侧 ${onlyLeft.length} · 仅右侧 ${onlyRight.length} · 契约不同 ${contractDiffs.length} · 契约一致 ${sameContractRows.length}</p>
+        ${this.renderOneSideGroup('仅左侧新增（右侧缺失）', onlyLeft, 'left')}
+        ${this.renderOneSideGroup('仅右侧新增（左侧缺失）', onlyRight, 'right')}
+        ${this.renderContractDiffGroup(contractDiffs)}
+        ${this.renderSameContractGroup(sameContractRows)}
+        ${fullyAligned ? html`<div class="issue info" style="margin-top:14px"><strong>属性完全一致</strong>两个组件的属性契约、描述与默认值没有差异。</div>` : nothing}
+      </section>
+    `;
+  }
+
+  private renderComparePickers(leftId: string, rightId: string): TemplateResult {
+    const options = this.store.state.components.map((item) => html`<option value=${item.id}>${item.name}（${item.category}）</option>`);
+    return html`
+      <div class="compare-pickers">
+        <label class="compare-picker">
+          <span>左侧组件</span>
+          <select aria-label="左侧对照组件" .value=${leftId} @change=${(event: Event) => this.setCompareSide('left', (event.currentTarget as HTMLSelectElement).value)}>${options}</select>
+        </label>
+        <sp-action-button label="交换两侧组件" @click=${() => this.swapCompare()}>⇄ 交换</sp-action-button>
+        <label class="compare-picker">
+          <span>右侧组件</span>
+          <select aria-label="右侧对照组件" .value=${rightId} @change=${(event: Event) => this.setCompareSide('right', (event.currentTarget as HTMLSelectElement).value)}>${options}</select>
+        </label>
+      </div>
+    `;
+  }
+
+  private renderCompareCard(component: ComponentSpec, counterpart: ComponentSpec, sideLabel: string): TemplateResult {
+    const fields = [
+      { label: '用途', value: component.purpose, other: counterpart.purpose },
+      { label: '状态', value: component.states, other: counterpart.states },
+      { label: '键盘行为', value: component.keyboardBehavior, other: counterpart.keyboardBehavior },
+      { label: '读屏说明', value: component.screenReader, other: counterpart.screenReader }
+    ];
+    return html`
+      <div class="compare-card">
+        <h3>${sideLabel} · ${component.name} <span class="pill ${component.status}">${this.statusLabel(component.status)}</span></h3>
+        <p class="compare-meta">${component.category} · r${component.revision} · ${component.properties.length} 个属性 · ${component.examples.length} 个示例</p>
+        ${fields.map((field) => {
+          const changed = field.value.trim() !== field.other.trim();
+          return html`
+            <div class="compare-field ${changed ? 'changed' : ''}">
+              <b>${field.label}${changed ? html`<span class="pill review">有差异</span>` : nothing}</b>
+              <p>${field.value || '（空）'}</p>
+            </div>
+          `;
+        })}
+      </div>
+    `;
+  }
+
+  private renderOneSideGroup(title: string, rows: PropertyComparison[], sourceSide: 'left' | 'right'): TemplateResult | typeof nothing {
+    const left = this.compareLeft;
+    const right = this.compareRight;
+    if (!rows.length || !left || !right) return nothing;
+    const source = sourceSide === 'left' ? left : right;
+    const target = sourceSide === 'left' ? right : left;
+    return html`
+      <div class="compare-group">
+        <h3>${title}<span class="pill">${rows.length}</span></h3>
+        ${rows.map((row) => {
+          const property = (sourceSide === 'left' ? row.left : row.right) as PropertySpec;
+          return html`
+            <div class="compare-row">
+              <div class="compare-row-head">
+                <strong>${property.name}</strong>
+                <span class="contract">${describeContract(property)}</span>
+                <sp-button size="s" variant="secondary" @click=${() => this.copyComparedProperty(source, property, target)}>复制到${sourceSide === 'left' ? '右侧' : '左侧'}</sp-button>
+              </div>
+              <p class="compare-note">默认值：${property.defaultValue || '（空）'} · ${property.description || '（无描述）'}</p>
+            </div>
+          `;
+        })}
+      </div>
+    `;
+  }
+
+  private renderContractDiffGroup(rows: PropertyComparison[]): TemplateResult | typeof nothing {
+    const left = this.compareLeft;
+    const right = this.compareRight;
+    if (!rows.length || !left || !right) return nothing;
+    return html`
+      <div class="compare-group">
+        <h3>同名但契约不同<span class="pill review">${rows.length}</span></h3>
+        ${rows.map((row) => html`
+          <div class="compare-row">
+            <div class="compare-row-head">
+              <strong>${row.name}</strong>
+              <span class="pill review">复制将被拦截</span>
+            </div>
+            <div class="compare-grid">
+              <div class="compare-field changed"><b>左侧契约</b><p>${row.left ? describeContract(row.left) : ''}</p></div>
+              <div class="compare-field changed"><b>右侧契约</b><p>${row.right ? describeContract(row.right) : ''}</p></div>
+            </div>
+            <p class="compare-note">${row.contractDiffs.join('；')}。请先对齐类型与必填，再复制描述或默认值。</p>
+            <div class="compare-actions" style="margin-top:8px">
+              <sp-button size="s" variant="secondary" @click=${() => this.copyComparedProperty(left, row.left as PropertySpec, right)}>仍尝试复制到右侧</sp-button>
+              <sp-button size="s" variant="secondary" @click=${() => this.copyComparedProperty(right, row.right as PropertySpec, left)}>仍尝试复制到左侧</sp-button>
+            </div>
+          </div>
+        `)}
+      </div>
+    `;
+  }
+
+  private renderSameContractGroup(rows: PropertyComparison[]): TemplateResult | typeof nothing {
+    const left = this.compareLeft;
+    const right = this.compareRight;
+    if (!rows.length || !left || !right) return nothing;
+    return html`
+      <div class="compare-group">
+        <h3>契约一致<span class="pill published">${rows.length}</span></h3>
+        ${rows.map((row) => {
+          const identical = !row.contentDiffs.length;
+          return html`
+            <div class="compare-row">
+              <div class="compare-row-head">
+                <strong>${row.name}</strong>
+                <span class="contract">${row.left ? describeContract(row.left) : ''}</span>
+                ${identical ? html`<span class="pill published">描述与默认值一致</span>` : html`
+                  <span class="pill review">${row.contentDiffs.join('、')}不同</span>
+                  <sp-button size="s" variant="secondary" @click=${() => this.copyComparedProperty(left, row.left as PropertySpec, right)}>同步到右侧</sp-button>
+                  <sp-button size="s" variant="secondary" @click=${() => this.copyComparedProperty(right, row.right as PropertySpec, left)}>同步到左侧</sp-button>
+                `}
+              </div>
+              ${identical ? nothing : html`<p class="compare-note">同步会用源组件的描述与默认值覆盖目标，类型与必填保持不变。</p>`}
+            </div>
+          `;
+        })}
+      </div>
+    `;
+  }
+
+  private get compareLeft(): ComponentSpec | undefined {
+    return this.store.state.components.find((item) => item.id === this.compareLeftId);
+  }
+
+  private get compareRight(): ComponentSpec | undefined {
+    return this.store.state.components.find((item) => item.id === this.compareRightId);
+  }
+
+  private restoreComparePair() {
+    const components = this.store.state.components;
+    let pair: ComparePair | undefined;
+    try {
+      const saved = localStorage.getItem(COMPARE_STORAGE_KEY);
+      if (saved) pair = JSON.parse(saved) as ComparePair;
+    } catch {
+      pair = undefined;
+    }
+    const exists = (id?: string) => Boolean(id) && components.some((item) => item.id === id);
+    const fallbackLeft = exists(this.store.state.selectedId) ? this.store.state.selectedId : components[0]?.id ?? '';
+    const fallbackRight = components.find((item) => item.id !== fallbackLeft)?.id ?? fallbackLeft;
+    this.compareLeftId = pair && exists(pair.leftId) ? pair.leftId : fallbackLeft;
+    this.compareRightId = pair && exists(pair.rightId) ? pair.rightId : fallbackRight;
+    this.persistComparePair();
+  }
+
+  private ensureComparePairValid() {
+    const components = this.store.state.components;
+    if (!components.length) return;
+    const exists = (id: string) => components.some((item) => item.id === id);
+    let changed = false;
+    if (!exists(this.compareLeftId)) {
+      this.compareLeftId = components[0].id;
+      changed = true;
+    }
+    if (!exists(this.compareRightId)) {
+      this.compareRightId = components.find((item) => item.id !== this.compareLeftId)?.id ?? this.compareLeftId;
+      changed = true;
+    }
+    if (changed) {
+      this.compareConflict = '';
+      this.persistComparePair();
+    }
+  }
+
+  private persistComparePair() {
+    try {
+      const pair: ComparePair = { leftId: this.compareLeftId, rightId: this.compareRightId };
+      localStorage.setItem(COMPARE_STORAGE_KEY, JSON.stringify(pair));
+    } catch {
+      // 本地存储不可用时，对照选择仅保留在当前会话。
+    }
+  }
+
+  private setCompareSide(side: 'left' | 'right', id: string) {
+    if (!this.store.state.components.some((item) => item.id === id)) return;
+    if (side === 'left') this.compareLeftId = id;
+    else this.compareRightId = id;
+    this.compareConflict = '';
+    this.persistComparePair();
+  }
+
+  private swapCompare() {
+    [this.compareLeftId, this.compareRightId] = [this.compareRightId, this.compareLeftId];
+    this.compareConflict = '';
+    this.persistComparePair();
+  }
+
+  private copyComparedProperty(source: ComponentSpec, property: PropertySpec, target: ComponentSpec) {
+    const result = this.store.copyPropertyBetween(source.id, property.id, target.id);
+    if (result.status === 'conflict' || result.status === 'invalid') {
+      this.compareConflict = result.message;
+      return;
+    }
+    this.compareConflict = '';
+    const staleNote = result.staleCount ? `，${result.staleCount} 个示例转为待复核` : '';
+    this.flash(`${result.message} 目标组件已生成 r${result.revision}${staleNote}。`);
   }
 
   private renderPreview(component?: ComponentSpec): TemplateResult {
